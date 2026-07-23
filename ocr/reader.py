@@ -16,9 +16,14 @@ ourselves and send it as a base64 data URI instead, for two reasons:
      error if the image can't be downloaded at all.
 """
 import base64
+import re
 import httpx
 from groq import Groq
 from config import settings
+
+# Safety net: strips any stray <think>...</think> block, in case the model
+# still emits internal reasoning despite reasoning_effort="none".
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 client = Groq(api_key=settings.GROQ_API_KEY)
 
@@ -66,9 +71,14 @@ def _fetch_image_bytes(image_url: str) -> tuple[bytes, str]:
             "try again, or upload the image directly."
         ) from e
 
-    content_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
+    content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
     if not content_type.startswith("image/"):
-        content_type = "image/jpeg"  # sane fallback
+        raise ValueError(
+            "That link doesn't point directly to an image — it looks like "
+            "it opens a webpage instead. Please use a direct image link "
+            "(usually ending in .jpg, .png, etc.), or upload the photo "
+            "directly."
+        )
     return response.content, content_type
 
 
@@ -94,6 +104,10 @@ def extract_question_text(image_url: str) -> str:
         ],
         temperature=0,
         max_completion_tokens=1024,
+        # qwen/qwen3.6-27b supports thinking/non-thinking modes. OCR is a
+        # simple extraction task with no need for reasoning, and thinking
+        # mode was leaking raw <think>...</think> content into the output.
+        reasoning_effort="none",
     )
 
     choice = completion.choices[0]
@@ -102,15 +116,16 @@ def extract_question_text(image_url: str) -> str:
     if choice.finish_reason == "length":
         raise ValueError(
             "This question is quite long, so we couldn't grab all of it in one go. "
-            "No worries though just try cropping the photo a little closer to the "
+            "No worries though — just try cropping the photo a little closer to the "
             "question, or if it has multiple parts, snap them one at a time. "
             "You'll have it sorted in a second try! 🙂"
         )
 
-    text = (choice.message.content or "").strip()
+    text = (choice.message.content or "")
+    text = _THINK_TAG_RE.sub("", text).strip()
     if text == "UNREADABLE" or not text:
         raise ValueError(
-            " we couldn't quite make out a question in this photo. "
+            "Hmm, we couldn't quite make out a question in this photo. "
             "A couple of quick tips that usually help:\n"
             "• Make sure the photo shows just the question, not notes or a full page,\n"
             "• Try to get good lighting and keep the text in focus,\n"
